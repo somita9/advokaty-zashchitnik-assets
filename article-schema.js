@@ -3,6 +3,14 @@
   window.__azArticleSchema = true;
   if (!/^\/tpost\//.test(location.pathname)) return;
 
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run);
+  } else {
+    run();
+  }
+
+  function run() {
+
   var ORG_URL = 'https://xn----7sbabhlyjaog8ag2de4i4a.xn--p1ai/';
   var ORG_NAME = 'Адвокатское бюро Свердловской области «Защитник»';
 
@@ -22,22 +30,63 @@
     if (m) datePublished = m[3] + '-' + m[2] + '-' + m[1];
   }
 
-  var articleContainer = document.querySelector('.t-feed__post-popup__text-wrapper') || document.body;
-  var paragraphs = [].slice.call(articleContainer.querySelectorAll('p'));
+  var articleContainer = document.querySelector('.t-redactor__text') ||
+    document.querySelector('.t-feed__post-popup__text-wrapper') || document.body;
+
+  // Статьи этого потока смешивают форматы: где-то плоский текст с <br> и
+  // <strong>, где-то настоящие <p>/<li> (иногда и то и другое в одной
+  // статье — интро-абзацы плоским текстом, дальше <ul><li> список).
+  // getLines() рекурсивно проходит дерево: <br> и границы P/H1-4/LI
+  // закрывают текущую "строку", инлайновые теги (STRONG/B/A и т.п.)
+  // остаются частью строки, а обёртки (DIV/UL/OL/SECTION...) просто
+  // раскрываются вглубь, не будучи сами по себе строкой.
+  var LINE_TAGS = /^(P|H1|H2|H3|H4|LI)$/;
+  var INLINE_TAGS = /^(STRONG|B|EM|I|A|SPAN|U|S|SMALL|MARK|SUB|SUP)$/;
+
+  function getLines(root) {
+    var lines = [];
+    var buf = [];
+    function flush() {
+      if (!buf.length) return;
+      var t = buf.map(function (n) { return n.textContent; }).join('').replace(/\s+/g, ' ').trim();
+      if (t) {
+        var fullyBold = buf.length === 1 && buf[0].nodeType === 1 &&
+          /^(STRONG|B)$/.test(buf[0].tagName) && text(buf[0]) === t;
+        lines.push({ text: t, fullyBold: fullyBold });
+      }
+      buf = [];
+    }
+    function walk(node) {
+      var children = node.childNodes;
+      for (var i = 0; i < children.length; i++) {
+        var n = children[i];
+        if (n.nodeType === 3) { buf.push(n); continue; }
+        if (n.nodeType !== 1) continue;
+        if (n.tagName === 'BR') { flush(); continue; }
+        if (LINE_TAGS.test(n.tagName)) { flush(); walk(n); flush(); continue; }
+        if (INLINE_TAGS.test(n.tagName)) { buf.push(n); continue; }
+        flush(); walk(n);
+      }
+    }
+    walk(root);
+    flush();
+    return lines;
+  }
+
+  var lines = getLines(articleContainer);
 
   // Meta-описание: у части статей (партия авг-сен 2026) поле SEO-описания
   // в Tilda пустое, платформа подставляет первую строку текста поста —
-  // на практике это строка "Дата публикации: ДД.ММ.ГГГГ". Чиним подстановкой
-  // первого содержательного абзаца — и в meta description/og:description
-  // (на случай, если поисковик их всё же учтёт), и в JSON-LD ниже.
+  // на практике строку "Дата публикации: ДД.ММ.ГГГГ". Чиним подстановкой
+  // первой содержательной (не жирной, не короткой) строки.
   var metaDesc = document.querySelector('meta[name="description"]');
   var descText = metaDesc ? metaDesc.content.trim() : '';
   var isBadDesc = !descText || descText.length < 20 || /^дата публикации/i.test(descText);
 
   if (isBadDesc) {
-    for (var i = 0; i < paragraphs.length; i++) {
-      var t = text(paragraphs[i]);
-      if (t.length > 40 && !/^дата публикации/i.test(t)) { descText = t; break; }
+    for (var i = 0; i < lines.length; i++) {
+      var t = lines[i].text;
+      if (t.length > 40 && !lines[i].fullyBold && !/^дата публикации/i.test(t)) { descText = t; break; }
     }
     if (descText.length > 300) descText = descText.slice(0, 297) + '…';
     if (descText) {
@@ -80,36 +129,25 @@
   s1.textContent = JSON.stringify(articleLd);
   document.head.appendChild(s1);
 
-  // FAQPage — только для статей, написанных по обновлённому промту
-  // (PROMPT_statyi_tilda.md в ivannikova-site-status): заголовок ровно
-  // "Частые вопросы", каждый вопрос — отдельный жирный абзац на "?",
-  // сразу за ним — абзац-ответ. У существующих статей на сайте такого
-  // единообразного блока нет (проверено выборочно), поэтому для старого
-  // контента FAQPage просто не добавится — это ожидаемо, не баг.
-  var headings = [].slice.call(articleContainer.querySelectorAll('h1,h2,h3,h4'));
-  var faqHeading = null;
-  for (var hi = 0; hi < headings.length; hi++) {
-    var ht = text(headings[hi]);
-    if (ht === 'Частые вопросы' || ht === 'Вопросы и ответы') { faqHeading = headings[hi]; break; }
+  // FAQPage — только для статей по обновлённому промту (PROMPT_statyi_tilda.md
+  // в ivannikova-site-status): строка ровно "Частые вопросы", каждый вопрос —
+  // отдельная жирная строка на "?", сразу после неё — строка-ответ.
+  var faqStart = -1;
+  for (var hi = 0; hi < lines.length; hi++) {
+    if (lines[hi].text === 'Частые вопросы' || lines[hi].text === 'Вопросы и ответы') { faqStart = hi; break; }
   }
 
-  if (faqHeading) {
+  if (faqStart >= 0) {
     var qa = [];
-    var node = faqHeading.nextElementSibling;
     var pendingQuestion = null;
-    while (node && !/^H[1-4]$/.test(node.tagName)) {
-      var nt = text(node);
-      if (nt) {
-        var boldChild = node.querySelector('b,strong');
-        var isBoldWholeLine = boldChild && text(boldChild) === nt;
-        if (/\?\s*$/.test(nt) && (isBoldWholeLine || /^(B|STRONG)$/.test(node.tagName))) {
-          pendingQuestion = nt;
-        } else if (pendingQuestion) {
-          qa.push({ q: pendingQuestion, a: nt });
-          pendingQuestion = null;
-        }
+    for (var j = faqStart + 1; j < lines.length; j++) {
+      var L = lines[j];
+      if (L.fullyBold && /\?\s*$/.test(L.text)) {
+        pendingQuestion = L.text;
+      } else if (pendingQuestion) {
+        qa.push({ q: pendingQuestion, a: L.text });
+        pendingQuestion = null;
       }
-      node = node.nextElementSibling;
     }
     if (qa.length) {
       var faqLd = {
@@ -125,5 +163,7 @@
       s2.textContent = JSON.stringify(faqLd);
       document.head.appendChild(s2);
     }
+  }
+
   }
 })();
